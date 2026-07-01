@@ -1,5 +1,6 @@
 from pathlib import Path
 import base64
+import re
 import shutil
 import subprocess
 import tempfile
@@ -21,21 +22,46 @@ PROCESSED_DIR = Path("/Users/erniehathaway/My Drive/05 Scans/02 Processed")
 NOT_IN_QBO_DIR = Path("/Users/erniehathaway/My Drive/05 Scans/03 Not in QBO")
 
 SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff"}
+ROTATABLE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff"}
 QBO_HOME_URL = "https://qbo.intuit.com"
 
 
 def get_receipt_files(folder: Path):
     if not folder.exists():
         return []
-
     return sorted(
-        [
-            file
-            for file in folder.iterdir()
-            if file.is_file() and file.suffix.lower() in SUPPORTED_EXTENSIONS
-        ],
-        key=lambda file: file.name.lower(),
+        [file for file in folder.iterdir() if file.is_file() and file.suffix.lower() in SUPPORTED_EXTENSIONS],
+        key=lambda file: (file.stat().st_mtime, file.name.lower()),
     )
+
+
+def get_current_index(files):
+    if not files:
+        st.session_state.pop("current_file_name", None)
+        return 0
+
+    current_name = st.session_state.get("current_file_name")
+    file_names = [file.name for file in files]
+    if current_name in file_names:
+        return file_names.index(current_name)
+
+    st.session_state["current_file_name"] = files[0].name
+    return 0
+
+
+def set_current_index(files, index: int):
+    if not files:
+        st.session_state.pop("current_file_name", None)
+        return
+    st.session_state["current_file_name"] = files[max(0, min(index, len(files) - 1))].name
+
+
+def set_next_after_move(files, current_index: int):
+    if len(files) <= 1:
+        st.session_state.pop("current_file_name", None)
+        return
+    next_index = current_index if current_index < len(files) - 1 else len(files) - 2
+    set_current_index(files, next_index)
 
 
 def open_path(path: Path):
@@ -62,50 +88,27 @@ def normalize_amount_text(value: str):
     return str(value or "").strip().replace("$", "").replace(",", "")
 
 
-def trigger_keyboard_maestro_global_search():
-    run_applescript(
-        """
-        tell application "System Events"
-            keystroke "k" using {command down, option down}
-        end tell
-        """
-    )
-
-
-def trigger_keyboard_maestro_bank_feed_search():
-    run_applescript(
-        """
-        tell application "System Events"
-            keystroke "h" using {command down, option down}
-        end tell
-        """
-    )
-
-
-def search_qbo_global_with_keyboard_maestro(amount: str):
+def search_qbo_global(amount: str):
     clean_amount = normalize_amount_text(amount)
-
     if not clean_amount:
         return False, "Enter an amount first."
 
     copy_to_clipboard(clean_amount)
-    time.sleep(0.2)
-    trigger_keyboard_maestro_global_search()
-
-    return True, f"Sent {clean_amount} to QBO Global search."
-
-
-def search_bank_feed_with_keyboard_maestro(amount: str):
-    clean_amount = normalize_amount_text(amount)
-
-    if not clean_amount:
-        return False, "Enter an amount first."
-
-    copy_to_clipboard(clean_amount)
-    time.sleep(0.2)
-    trigger_keyboard_maestro_bank_feed_search()
-
-    return True, f"Sent {clean_amount} to Bank Feed search."
+    time.sleep(0.15)
+    run_applescript(
+        """
+        tell application "Google Chrome" to activate
+        delay 0.2
+        tell application "System Events"
+            keystroke "f" using {control down, option down}
+            delay 0.2
+            keystroke "v" using {command down}
+            delay 0.1
+            key code 36
+        end tell
+        """
+    )
+    return True, f"Searched QBO Global for {clean_amount}."
 
 
 def unique_destination_path(destination: Path):
@@ -116,11 +119,9 @@ def unique_destination_path(destination: Path):
     suffix = destination.suffix
     parent = destination.parent
     counter = 2
-
     while destination.exists():
         destination = parent / f"{stem} ({counter}){suffix}"
         counter += 1
-
     return destination
 
 
@@ -145,13 +146,12 @@ def undo_last_move():
     last_move = st.session_state["last_move"]
     moved_path = Path(last_move["moved_path"])
     original_path = Path(last_move["original_path"])
-
     if not moved_path.exists():
         return False, "Could not undo. The moved file is no longer where expected."
 
     restored_to = move_file_back(moved_path, original_path)
+    st.session_state["current_file_name"] = restored_to.name
     del st.session_state["last_move"]
-
     return True, f"Restored: {restored_to.name}"
 
 
@@ -162,22 +162,46 @@ def ensure_viewer_state():
 
 def render_pdf_page_to_png(pdf_path: Path, page_number: int = 0, zoom: float = 2.2):
     doc = fitz.open(str(pdf_path))
-
     if doc.page_count == 0:
         doc.close()
         return None, 0
 
     page_number = max(0, min(page_number, doc.page_count - 1))
     page = doc.load_page(page_number)
-
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
     pix.save(temp_file.name)
-
     page_count = doc.page_count
     doc.close()
-
     return temp_file.name, page_count
+
+
+def rotate_pdf_in_place(file_path: Path):
+    doc = fitz.open(str(file_path))
+    for page in doc:
+        page.set_rotation((page.rotation + 90) % 360)
+    temp_path = file_path.with_suffix(f".rotating{file_path.suffix}")
+    doc.save(str(temp_path), garbage=4, deflate=True)
+    doc.close()
+    temp_path.replace(file_path)
+
+
+def rotate_image_in_place(file_path: Path):
+    result = subprocess.run(["sips", "-r", "90", str(file_path)], capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "sips could not rotate this file."
+        raise RuntimeError(detail)
+
+
+def rotate_current_file(file_path: Path):
+    suffix = file_path.suffix.lower()
+    if suffix == ".pdf":
+        rotate_pdf_in_place(file_path)
+        return True, f"Rotated PDF: {file_path.name}"
+    if suffix in ROTATABLE_IMAGE_EXTENSIONS:
+        rotate_image_in_place(file_path)
+        return True, f"Rotated image: {file_path.name}"
+    return False, "Rotate is not available for this file type."
 
 
 def file_to_base64(file_path: Path):
@@ -194,7 +218,6 @@ def get_logo_path():
 
 def render_header_logo():
     logo_path = get_logo_path()
-
     if logo_path:
         encoded = file_to_base64(logo_path)
         st.markdown(
@@ -215,11 +238,7 @@ def show_image_in_receipt_frame(image_path: Path, mime_type: str = "image/png", 
         f"""
         <div class="receipt-frame">
             <div class="receipt-canvas">
-                <img
-                    src="data:{mime_type};base64,{encoded}"
-                    class="receipt-image"
-                    style="transform: scale({scale});"
-                />
+                <img src="data:{mime_type};base64,{encoded}" class="receipt-image" style="transform: scale({scale});" />
             </div>
         </div>
         """,
@@ -233,31 +252,20 @@ def show_receipt_preview(file_path: Path):
 
     if suffix == ".pdf":
         page_key = f"page_number_{file_path.name}"
-
         if page_key not in st.session_state:
             st.session_state[page_key] = 0
 
-        image_path, page_count = render_pdf_page_to_png(
-            file_path,
-            page_number=st.session_state[page_key],
-        )
-
+        image_path, page_count = render_pdf_page_to_png(file_path, page_number=st.session_state[page_key])
         if image_path:
             show_image_in_receipt_frame(Path(image_path), mime_type="image/png", scale=viewer_scale)
             nav1, nav2, nav3 = st.columns([1, 1.1, 1])
-
             with nav1:
                 previous_disabled = page_count <= 1 or st.session_state[page_key] <= 0
                 if st.button("Previous Page", use_container_width=True, disabled=previous_disabled):
                     st.session_state[page_key] = max(0, st.session_state[page_key] - 1)
                     st.rerun()
-
             with nav2:
-                st.markdown(
-                    f'<div class="page-count">Page {st.session_state[page_key] + 1} of {page_count}</div>',
-                    unsafe_allow_html=True,
-                )
-
+                st.markdown(f'<div class="page-count">Page {st.session_state[page_key] + 1} of {page_count}</div>', unsafe_allow_html=True)
             with nav3:
                 next_disabled = page_count <= 1 or st.session_state[page_key] >= page_count - 1
                 if st.button("Next Page", use_container_width=True, disabled=next_disabled):
@@ -265,14 +273,85 @@ def show_receipt_preview(file_path: Path):
                     st.rerun()
         else:
             st.warning("Could not preview this PDF.")
-
-    elif suffix in {".png", ".jpg", ".jpeg"}:
+    elif suffix in {".png", ".jpg", ".jpeg", ".heic", ".tif", ".tiff"}:
         mime_type = "image/png" if suffix == ".png" else "image/jpeg"
         show_image_in_receipt_frame(file_path, mime_type=mime_type, scale=viewer_scale)
         st.markdown('<div class="page-count">Single image receipt</div>', unsafe_allow_html=True)
-
     else:
         st.info("Preview not available for this file type yet. Use Open Receipt.")
+
+
+def candidate_amounts_from_text(text: str):
+    money_pattern = re.compile(r"(?:\$\s*)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{2})?)")
+    scored = []
+    keywords = ("grand total", "ticket total", "balance due", "amount", "total", "sale")
+
+    for line_number, line in enumerate(text.splitlines()):
+        normalized_line = line.lower()
+        for match in money_pattern.finditer(line):
+            raw = match.group(1).replace(",", "")
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if value <= 0:
+                continue
+            score = 1
+            for keyword in keywords:
+                if keyword in normalized_line:
+                    score += 10
+                    if keyword in {"grand total", "ticket total", "balance due"}:
+                        score += 8
+            if "$" in line:
+                score += 2
+            score += min(line_number, 20) / 100
+            scored.append((score, value, raw))
+
+    scored.sort(reverse=True)
+    return scored
+
+
+def ocr_image_path(image_path: Path):
+    try:
+        from PIL import Image
+        import pytesseract
+    except ImportError:
+        return False, "OCR needs Pillow + pytesseract installed for this v1.", ""
+
+    try:
+        with Image.open(image_path) as image:
+            text = pytesseract.image_to_string(image)
+    except Exception as exc:
+        return False, f"OCR failed: {exc}", ""
+
+    return True, "OCR complete.", text
+
+
+def read_total_from_file(file_path: Path):
+    suffix = file_path.suffix.lower()
+    temp_image = None
+
+    if suffix == ".pdf":
+        temp_image, page_count = render_pdf_page_to_png(file_path, page_number=0, zoom=3.0)
+        if not temp_image:
+            return False, "Could not render PDF for OCR."
+        ocr_target = Path(temp_image)
+    else:
+        ocr_target = file_path
+
+    success, message, text = ocr_image_path(ocr_target)
+    if temp_image:
+        Path(temp_image).unlink(missing_ok=True)
+    if not success:
+        return False, message
+
+    candidates = candidate_amounts_from_text(text)
+    if not candidates:
+        return False, "OCR ran, but I could not find a likely total."
+
+    best_amount = f"{candidates[0][1]:.2f}"
+    st.session_state["qbo_search_amount"] = best_amount
+    return True, f"OCR guessed {best_amount}. Check it before searching."
 
 
 def stat_box(label: str, value: int):
@@ -293,14 +372,9 @@ def set_status(message: str, status_type: str = "info"):
 
 def show_status():
     status = st.session_state.get("last_status")
-
     if not status:
         return
-
-    st.markdown(
-        f'<div class="status-line status-{status.get("status_type", "info")}">{status.get("message", "")}</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="status-line status-{status.get("status_type", "info")}">{status.get("message", "")}</div>', unsafe_allow_html=True)
 
 
 def clear_qbo_search_amount():
@@ -308,51 +382,33 @@ def clear_qbo_search_amount():
     set_status("Amount cleared.", "info")
 
 
-def render_right_panel(pending_count: int, processed_count: int, not_in_qbo_count: int, total_started: int, current_file: Path):
+def render_right_panel(pending_files, current_index, pending_count, processed_count, not_in_qbo_count, total_started, current_file):
     with st.container(border=True):
         stat1, stat2, stat3, stat4 = st.columns(4)
-
         with stat1:
             stat_box("Pending", pending_count)
         with stat2:
             stat_box("Done", processed_count)
         with stat3:
-            stat_box("Not QBO", not_in_qbo_count)
+            stat_box("Needs Review", not_in_qbo_count)
         with stat4:
             stat_box("Total", total_started)
 
-        st.markdown(
-            f'<div class="progress-text">Processed {processed_count} of {total_started} / {pending_count} remaining.</div>',
-            unsafe_allow_html=True,
-        )
-
+        st.markdown(f'<div class="progress-text">Processed {processed_count} of {total_started} / {pending_count} remaining.</div>', unsafe_allow_html=True)
         st.markdown('<div class="section-title first-section">QBO Search</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="helper-text">Enter the receipt amount. Buttons copy it and fire Keyboard Maestro.</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="helper-text">Enter or OCR the receipt amount, then search QBO in one click.</div>', unsafe_allow_html=True)
 
-        amount_input = st.text_input(
-            "Receipt amount",
-            key="qbo_search_amount",
-            placeholder="117.98",
-        )
-
+        amount_input = st.text_input("Receipt amount", key="qbo_search_amount", placeholder="117.98")
         clean_amount = normalize_amount_text(amount_input)
 
-        copy_col, clear_col, undo_col = st.columns([1, 1, 1])
-
-        with copy_col:
-            if st.button("Copy Amount", use_container_width=True):
-                if clean_amount:
-                    copy_to_clipboard(clean_amount)
-                    set_status(f"Copied {clean_amount}.", "success")
-                else:
-                    set_status("Enter an amount first.", "warning")
-
+        ocr_col, clear_col, undo_col = st.columns([1, 1, 1])
+        with ocr_col:
+            if st.button("Read Total / OCR", use_container_width=True):
+                success, message = read_total_from_file(current_file)
+                set_status(message, "success" if success else "warning")
+                st.rerun()
         with clear_col:
             st.button("Clear Amount", use_container_width=True, on_click=clear_qbo_search_amount)
-
         with undo_col:
             undo_disabled = "last_move" not in st.session_state
             if st.button("Undo Move", use_container_width=True, disabled=undo_disabled):
@@ -360,71 +416,58 @@ def render_right_panel(pending_count: int, processed_count: int, not_in_qbo_coun
                 set_status(message, "success" if success else "warning")
                 st.rerun()
 
-        search1, search2 = st.columns([1, 1])
+        if st.button("Search QBO", type="primary", use_container_width=True):
+            success, message = search_qbo_global(clean_amount)
+            set_status(message, "success" if success else "warning")
 
-        with search1:
-            if st.button("Search QBO Global", type="primary", use_container_width=True):
-                success, message = search_qbo_global_with_keyboard_maestro(clean_amount)
-                set_status(message, "success" if success else "warning")
-
-        with search2:
-            if st.button("Search Bank Feed", type="primary", use_container_width=True):
-                success, message = search_bank_feed_with_keyboard_maestro(clean_amount)
-                set_status(message, "success" if success else "warning")
-
-        st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
-
-        action1, action2 = st.columns([1, 1])
-
-        with action1:
-            if st.button("Open Receipt", use_container_width=True):
-                open_path(current_file)
-
-        with action2:
+        with st.expander("Manual backup tools"):
+            if st.button("Copy Amount Only", use_container_width=True):
+                if clean_amount:
+                    copy_to_clipboard(clean_amount)
+                    set_status(f"Copied {clean_amount}.", "success")
+                else:
+                    set_status("Enter an amount first.", "warning")
             if st.button("Open QBO Chrome", use_container_width=True):
                 open_qbo_chrome()
 
-        action3, action4, action5 = st.columns([1, 1, 1])
+        st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
+        action1, action2 = st.columns([1, 1])
+        with action1:
+            if st.button("Open Receipt", use_container_width=True):
+                open_path(current_file)
+        with action2:
+            if st.button("Rotate", use_container_width=True):
+                try:
+                    success, message = rotate_current_file(current_file)
+                except Exception as exc:
+                    success, message = False, f"Rotate failed: {exc}"
+                set_status(message, "success" if success else "warning")
+                st.rerun()
 
+        action3, action4 = st.columns([1, 1])
         with action3:
-            if st.button("Mark Done", type="primary", use_container_width=True):
+            if st.button("Done", type="primary", use_container_width=True):
                 original_path = current_file
                 moved_to = move_file(current_file, PROCESSED_DIR)
-                st.session_state["last_move"] = {
-                    "original_path": str(original_path),
-                    "moved_path": str(moved_to),
-                    "action": "processed",
-                }
+                st.session_state["last_move"] = {"original_path": str(original_path), "moved_path": str(moved_to), "action": "processed"}
+                set_next_after_move(pending_files, current_index)
                 set_status(f"Moved to Processed: {moved_to.name}", "success")
                 st.rerun()
-
         with action4:
-            if st.button("Not in QBO", type="primary", use_container_width=True):
+            if st.button("Needs Review", type="primary", use_container_width=True):
                 original_path = current_file
                 moved_to = move_file(current_file, NOT_IN_QBO_DIR)
-                st.session_state["last_move"] = {
-                    "original_path": str(original_path),
-                    "moved_path": str(moved_to),
-                    "action": "not_in_qbo",
-                }
-                set_status(f"Moved to Not in QBO: {moved_to.name}", "warning")
+                st.session_state["last_move"] = {"original_path": str(original_path), "moved_path": str(moved_to), "action": "not_in_qbo"}
+                set_next_after_move(pending_files, current_index)
+                set_status(f"Moved to Needs Review: {moved_to.name}", "warning")
                 st.rerun()
 
-        with action5:
-            if st.button("Skip / Next", type="primary", use_container_width=True):
-                set_status("Skip sorting comes later. For now, leave it where it is.", "info")
-
         st.markdown('<div class="panel-box">', unsafe_allow_html=True)
-
         if "last_move" in st.session_state:
             moved_path = Path(st.session_state["last_move"]["moved_path"])
             st.markdown(f'<div class="last-move-small">Last moved: {moved_path.name}</div>', unsafe_allow_html=True)
-
         show_status()
-        st.markdown(
-            '<div class="small-note">Chrome should already have the correct client QBO file available. Keyboard Maestro handles the clicky nonsense.</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="small-note">QBO search uses Ctrl-Option-F, pastes the amount, then presses Return. Bank feed search stays manual for now.</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -435,172 +478,32 @@ st.markdown(
     """
     <style>
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap');
-
-        :root {
-            --antihub-ink: #421333;
-            --antihub-berry: #8B325B;
-            --antihub-pink: #E25A8A;
-            --antihub-blush: #FEEBF1;
-            --antihub-soft: #F8D8E3;
-            --antihub-white: #FFFFFF;
-            --antihub-muted: rgba(66, 19, 51, 0.62);
-        }
-
-        html,
-        body,
-        .stApp,
-        [data-testid="stAppViewContainer"],
-        [data-testid="stMain"] {
-            min-height: 100%;
-            overflow-y: auto !important;
-        }
-
+        :root { --antihub-ink: #421333; --antihub-berry: #8B325B; --antihub-pink: #E25A8A; --antihub-blush: #FEEBF1; --antihub-white: #FFFFFF; --antihub-muted: rgba(66, 19, 51, 0.62); }
+        html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { min-height: 100%; overflow-y: auto !important; }
         * { font-family: 'DM Sans', sans-serif; }
-
-        .stApp {
-            background: radial-gradient(circle at top left, rgba(226, 90, 138, 0.28), transparent 32rem),
-                        linear-gradient(135deg, var(--antihub-ink) 0%, #2a0c21 100%);
-            color: var(--antihub-ink);
-        }
-
-        .block-container {
-            max-width: 1560px;
-            margin: 1.15rem auto 2.5rem auto;
-            background: var(--antihub-white);
-            border-radius: 1.8rem;
-            padding: 2.1rem 2.8rem 3rem 2.8rem !important;
-            box-shadow: 0 28px 90px rgba(66, 19, 51, 0.46);
-            overflow: visible !important;
-        }
-
+        .stApp { background: radial-gradient(circle at top left, rgba(226, 90, 138, 0.28), transparent 32rem), linear-gradient(135deg, var(--antihub-ink) 0%, #2a0c21 100%); color: var(--antihub-ink); }
+        .block-container { max-width: 1560px; margin: 1.15rem auto 2.5rem auto; background: var(--antihub-white); border-radius: 1.8rem; padding: 2.1rem 2.8rem 3rem 2.8rem !important; box-shadow: 0 28px 90px rgba(66, 19, 51, 0.46); overflow: visible !important; }
         div[data-testid="stVerticalBlock"] { gap: 0.72rem !important; }
         div[data-testid="column"] { padding-top: 0 !important; }
-
-        .header-logo-box {
-            width: 560px;
-            max-width: 100%;
-            height: 120px;
-            display: flex;
-            align-items: center;
-            justify-content: flex-start;
-            overflow: visible;
-        }
-
-        .header-logo-img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-            object-position: left center;
-            display: block;
-        }
-
-        .missing-header-logo {
-            color: var(--antihub-ink);
-            border: 2px solid var(--antihub-pink);
-            border-radius: 0.72rem;
-            padding: 1rem 2rem;
-            font-weight: 900;
-            font-size: 2rem;
-        }
-
-        .header-tagline {
-            font-size: 1.35rem;
-            font-weight: 700;
-            letter-spacing: -0.03em;
-            text-align: right;
-            white-space: nowrap;
-            padding-top: 0.45rem;
-        }
-
+        .header-logo-box { width: 560px; max-width: 100%; height: 120px; display: flex; align-items: center; justify-content: flex-start; overflow: visible; }
+        .header-logo-img { width: 100%; height: 100%; object-fit: contain; object-position: left center; display: block; }
+        .missing-header-logo { color: var(--antihub-ink); border: 2px solid var(--antihub-pink); border-radius: 0.72rem; padding: 1rem 2rem; font-weight: 900; font-size: 2rem; }
+        .header-tagline { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.03em; text-align: right; white-space: nowrap; padding-top: 0.45rem; }
         .tag-blue { color: var(--antihub-berry); }
         .tag-pink { color: var(--antihub-pink); }
-
-        .receipt-frame {
-            background: linear-gradient(180deg, var(--antihub-blush), #ffffff);
-            border: 1px solid rgba(139, 50, 91, 0.12);
-            border-radius: 1.1rem;
-            height: min(62vh, 720px);
-            min-height: 500px;
-            overflow: auto;
-            padding: 1rem;
-            margin-bottom: 0.7rem;
-        }
-
-        .receipt-canvas {
-            width: 100%;
-            min-height: 100%;
-            display: flex;
-            align-items: flex-start;
-            justify-content: center;
-        }
-
-        .receipt-image {
-            display: block;
-            max-width: 100%;
-            height: auto;
-            transform-origin: top center;
-            border-radius: 0.3rem;
-            box-shadow: 0 2px 12px rgba(66, 19, 51, 0.12);
-        }
-
-        [data-testid="stVerticalBlockBorderWrapper"] {
-            border: 1.5px solid var(--antihub-pink) !important;
-            border-radius: 1.35rem !important;
-            padding: 1.25rem !important;
-            box-shadow: 0 18px 45px rgba(226, 90, 138, 0.12);
-        }
-
-        .stat-box {
-            background: var(--antihub-blush);
-            color: var(--antihub-ink);
-            border: 1px solid rgba(139, 50, 91, 0.10);
-            border-radius: 1rem;
-            padding: 0.9rem 0.5rem 1rem 0.5rem;
-            text-align: center;
-            margin-bottom: 0;
-        }
-
-        .stat-value {
-            font-size: 1.75rem;
-            font-weight: 900;
-            line-height: 1.0;
-            letter-spacing: -0.04em;
-            color: var(--antihub-berry);
-        }
-
-        .stat-label {
-            font-size: 0.58rem;
-            opacity: 0.72;
-            margin-top: 0.28rem;
-            text-transform: uppercase;
-            letter-spacing: 0.07em;
-        }
-
-        .progress-text,
-        .helper-text,
-        .zoom-note,
-        .page-count,
-        .small-note {
-            color: var(--antihub-muted);
-            line-height: 1.35;
-        }
-
+        .receipt-frame { background: linear-gradient(180deg, var(--antihub-blush), #ffffff); border: 1px solid rgba(139, 50, 91, 0.12); border-radius: 1.1rem; height: min(62vh, 720px); min-height: 500px; overflow: auto; padding: 1rem; margin-bottom: 0.7rem; }
+        .receipt-canvas { width: 100%; min-height: 100%; display: flex; align-items: flex-start; justify-content: center; }
+        .receipt-image { display: block; max-width: 100%; height: auto; transform-origin: top center; border-radius: 0.3rem; box-shadow: 0 2px 12px rgba(66, 19, 51, 0.12); }
+        [data-testid="stVerticalBlockBorderWrapper"] { border: 1.5px solid var(--antihub-pink) !important; border-radius: 1.35rem !important; padding: 1.25rem !important; box-shadow: 0 18px 45px rgba(226, 90, 138, 0.12); }
+        .stat-box { background: var(--antihub-blush); color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.10); border-radius: 1rem; padding: 0.9rem 0.5rem 1rem 0.5rem; text-align: center; }
+        .stat-value { font-size: 1.75rem; font-weight: 900; line-height: 1.0; letter-spacing: -0.04em; color: var(--antihub-berry); }
+        .stat-label { font-size: 0.58rem; opacity: 0.72; margin-top: 0.28rem; text-transform: uppercase; letter-spacing: 0.07em; }
+        .progress-text, .helper-text, .zoom-note, .page-count, .small-note { color: var(--antihub-muted); line-height: 1.35; }
         .progress-text { font-size: 0.68rem; margin: 0.15rem 0 1.25rem 0; }
         .helper-text { font-size: 0.64rem; margin: 0 0 0.45rem 0; }
         .zoom-note, .page-count { text-align: center; font-size: 0.62rem; padding-top: 0.35rem; }
         .small-note { font-size: 0.58rem; margin-top: 0.5rem; }
-
-        .section-title {
-            font-size: 0.78rem;
-            font-weight: 800;
-            color: var(--antihub-berry);
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            margin: 1.7rem 0 0.6rem 0;
-            padding-bottom: 0.5rem;
-            border-bottom: 1px solid rgba(139, 50, 91, 0.14);
-        }
-
+        .section-title { font-size: 0.78rem; font-weight: 800; color: var(--antihub-berry); letter-spacing: 0.08em; text-transform: uppercase; margin: 1.7rem 0 0.6rem 0; padding-bottom: 0.5rem; border-bottom: 1px solid rgba(139, 50, 91, 0.14); }
         .first-section { margin-top: 0.2rem; }
         .current-file { font-size: 0.78rem; margin: 1rem 0 0.8rem 0; color: var(--antihub-ink); }
         .current-file code { background: var(--antihub-blush); color: var(--antihub-berry); padding: 0.15rem 0.42rem; border-radius: 0.35rem; font-size: 0.72rem; }
@@ -611,11 +514,8 @@ st.markdown(
         .status-warning { background: var(--antihub-blush); border: 1px solid rgba(226, 90, 138, 0.42); color: var(--antihub-ink); }
         .stTextInput label { color: var(--antihub-berry); font-size: 0.78rem; font-weight: 800; letter-spacing: 0.02em; }
         .stTextInput input { background: #ffffff; color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.22); border-radius: 0.75rem; min-height: 3rem; font-size: 1.05rem; padding: 0 1rem; }
-        .stTextInput input:focus { border-color: var(--antihub-pink); box-shadow: 0 0 0 0.12rem rgba(226, 90, 138, 0.16); }
-        .stButton > button { min-height: 2.6rem; padding: 0 1.1rem; background: #ffffff; color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.24); border-radius: 0.75rem; font-weight: 600; font-size: 0.78rem; letter-spacing: 0.01em; transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s; }
-        .stButton > button:hover { border-color: var(--antihub-pink); box-shadow: 0 2px 8px rgba(226, 90, 138, 0.14); color: var(--antihub-ink); transform: translateY(-1px); }
+        .stButton > button { min-height: 2.6rem; padding: 0 1.1rem; background: #ffffff; color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.24); border-radius: 0.75rem; font-weight: 600; font-size: 0.78rem; }
         .stButton > button[kind="primary"] { background: linear-gradient(105deg, var(--antihub-berry) 0%, var(--antihub-pink) 100%); color: white; border: none; font-weight: 700; font-size: 0.82rem; min-height: 2.85rem; }
-        .stButton > button[kind="primary"]:hover { background: linear-gradient(105deg, var(--antihub-ink) 0%, var(--antihub-berry) 100%); color: white; border: none; box-shadow: 0 6px 20px rgba(226, 90, 138, 0.36); }
         hr { margin-top: 0.6rem; margin-bottom: 0.6rem; border-color: rgba(139, 50, 91, 0.12); }
         #MainMenu, header, footer { visibility: hidden; }
         [data-testid="stHeader"] { height: 0; }
@@ -634,10 +534,8 @@ not_in_qbo_count = len(not_in_qbo_files)
 total_started = pending_count + processed_count + not_in_qbo_count
 
 header_left, header_right = st.columns([0.95, 1.55])
-
 with header_left:
     render_header_logo()
-
 with header_right:
     st.markdown(
         """
@@ -652,43 +550,43 @@ with header_right:
 if pending_count == 0:
     left, right = st.columns([1.0, 1.25], gap="large")
     with left:
-        st.markdown(
-            '<div class="panel-box"><div class="section-title first-section">All caught up</div><div class="helper-text">No pending receipts in 01 Pending.</div></div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown('<div class="panel-box"><div class="section-title first-section">All caught up</div><div class="helper-text">No pending receipts in 01 Pending.</div></div>', unsafe_allow_html=True)
     st.stop()
 
-current_file = pending_files[0]
+current_index = get_current_index(pending_files)
+current_file = pending_files[current_index]
 left, right = st.columns([1.15, 1.0], gap="large")
 
 with left:
-    st.markdown(
-        f'<div class="current-file"><b>Current Receipt:</b> <code>{current_file.name}</code></div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="current-file"><b>Current Receipt:</b> <code>{current_file.name}</code></div>', unsafe_allow_html=True)
+    nav_back, nav_position, nav_next = st.columns([1, 1.1, 1])
+    with nav_back:
+        if st.button("Back", use_container_width=True, disabled=current_index <= 0):
+            set_current_index(pending_files, current_index - 1)
+            st.rerun()
+    with nav_position:
+        st.markdown(f'<div class="page-count">Receipt {current_index + 1} of {pending_count}</div>', unsafe_allow_html=True)
+    with nav_next:
+        if st.button("Next", use_container_width=True, disabled=current_index >= pending_count - 1):
+            set_current_index(pending_files, current_index + 1)
+            st.rerun()
+
     show_receipt_preview(current_file)
 
     zoom_col1, zoom_col2, zoom_col3 = st.columns([1, 1, 1])
-
     with zoom_col1:
         if st.button("Zoom Out", use_container_width=True):
             st.session_state["viewer_scale"] = max(0.50, round(st.session_state["viewer_scale"] - 0.08, 2))
             st.rerun()
-
     with zoom_col2:
         if st.button("Reset Zoom", use_container_width=True):
             st.session_state["viewer_scale"] = 0.92
             st.rerun()
-
     with zoom_col3:
         if st.button("Zoom In", use_container_width=True):
             st.session_state["viewer_scale"] = min(2.0, round(st.session_state["viewer_scale"] + 0.08, 2))
             st.rerun()
-
-    st.markdown(
-        f'<div class="zoom-note">Viewer zoom: {int(st.session_state["viewer_scale"] * 100)}%</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown(f'<div class="zoom-note">Viewer zoom: {int(st.session_state["viewer_scale"] * 100)}%</div>', unsafe_allow_html=True)
 
 with right:
-    render_right_panel(pending_count, processed_count, not_in_qbo_count, total_started, current_file)
+    render_right_panel(pending_files, current_index, pending_count, processed_count, not_in_qbo_count, total_started, current_file)
