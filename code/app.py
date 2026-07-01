@@ -446,6 +446,15 @@ st.markdown(
             --antihub-muted: rgba(66, 19, 51, 0.62);
         }
 
+        html,
+        body,
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stMain"] {
+            min-height: 100%;
+            overflow-y: auto !important;
+        }
+
         * { font-family: 'DM Sans', sans-serif; }
 
         .stApp {
@@ -456,12 +465,12 @@ st.markdown(
 
         .block-container {
             max-width: 1560px;
-            margin: 1.15rem auto;
+            margin: 1.15rem auto 2.5rem auto;
             background: var(--antihub-white);
             border-radius: 1.8rem;
-            padding: 2.1rem 2.8rem 2.4rem 2.8rem !important;
+            padding: 2.1rem 2.8rem 3rem 2.8rem !important;
             box-shadow: 0 28px 90px rgba(66, 19, 51, 0.46);
-            overflow: hidden;
+            overflow: visible !important;
         }
 
         div[data-testid="stVerticalBlock"] { gap: 0.72rem !important; }
@@ -474,7 +483,7 @@ st.markdown(
             display: flex;
             align-items: center;
             justify-content: flex-start;
-            overflow: hidden;
+            overflow: visible;
         }
 
         .header-logo-img {
@@ -510,9 +519,8 @@ st.markdown(
             background: linear-gradient(180deg, var(--antihub-blush), #ffffff);
             border: 1px solid rgba(139, 50, 91, 0.12);
             border-radius: 1.1rem;
-            height: calc(100vh - 18rem);
-            min-height: 520px;
-            max-height: 780px;
+            height: min(62vh, 720px);
+            min-height: 500px;
             overflow: auto;
             padding: 1rem;
             margin-bottom: 0.7rem;
