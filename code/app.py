@@ -303,6 +303,11 @@ def show_status():
     )
 
 
+def clear_qbo_search_amount():
+    st.session_state["qbo_search_amount"] = ""
+    set_status("Amount cleared.", "info")
+
+
 def render_right_panel(pending_count: int, processed_count: int, not_in_qbo_count: int, total_started: int, current_file: Path):
     with st.container(border=True):
         stat1, stat2, stat3, stat4 = st.columns(4)
@@ -327,20 +332,18 @@ def render_right_panel(pending_count: int, processed_count: int, not_in_qbo_coun
             unsafe_allow_html=True,
         )
 
-        amount_col, copy_col, clear_col, undo_col = st.columns([1.45, 0.72, 0.72, 0.9])
-
-        with amount_col:
-            amount_input = st.text_input(
-                "Amount",
-                key="qbo_search_amount",
-                placeholder="117.98",
-                label_visibility="collapsed",
-            )
+        amount_input = st.text_input(
+            "Receipt amount",
+            key="qbo_search_amount",
+            placeholder="117.98",
+        )
 
         clean_amount = normalize_amount_text(amount_input)
 
+        copy_col, clear_col, undo_col = st.columns([1, 1, 1])
+
         with copy_col:
-            if st.button("Copy", use_container_width=True):
+            if st.button("Copy Amount", use_container_width=True):
                 if clean_amount:
                     copy_to_clipboard(clean_amount)
                     set_status(f"Copied {clean_amount}.", "success")
@@ -348,14 +351,11 @@ def render_right_panel(pending_count: int, processed_count: int, not_in_qbo_coun
                     set_status("Enter an amount first.", "warning")
 
         with clear_col:
-            if st.button("Clear", use_container_width=True):
-                st.session_state["qbo_search_amount"] = ""
-                set_status("Amount cleared.", "info")
-                st.rerun()
+            st.button("Clear Amount", use_container_width=True, on_click=clear_qbo_search_amount)
 
         with undo_col:
             undo_disabled = "last_move" not in st.session_state
-            if st.button("Undo", use_container_width=True, disabled=undo_disabled):
+            if st.button("Undo Move", use_container_width=True, disabled=undo_disabled):
                 success, message = undo_last_move()
                 set_status(message, "success" if success else "warning")
                 st.rerun()
@@ -609,7 +609,8 @@ st.markdown(
         .status-line { border-radius: 0.65rem; padding: 0.6rem 0.75rem; margin-top: 0.2rem; font-size: 0.65rem; line-height: 1.3; }
         .status-success, .status-info { background: #ffffff; border: 1px solid rgba(226, 90, 138, 0.25); color: var(--antihub-berry); }
         .status-warning { background: var(--antihub-blush); border: 1px solid rgba(226, 90, 138, 0.42); color: var(--antihub-ink); }
-        .stTextInput input { background: #ffffff; color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.22); border-radius: 0.75rem; min-height: 2.6rem; font-size: 0.88rem; padding: 0 0.85rem; }
+        .stTextInput label { color: var(--antihub-berry); font-size: 0.78rem; font-weight: 800; letter-spacing: 0.02em; }
+        .stTextInput input { background: #ffffff; color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.22); border-radius: 0.75rem; min-height: 3rem; font-size: 1.05rem; padding: 0 1rem; }
         .stTextInput input:focus { border-color: var(--antihub-pink); box-shadow: 0 0 0 0.12rem rgba(226, 90, 138, 0.16); }
         .stButton > button { min-height: 2.6rem; padding: 0 1.1rem; background: #ffffff; color: var(--antihub-ink); border: 1px solid rgba(139, 50, 91, 0.24); border-radius: 0.75rem; font-weight: 600; font-size: 0.78rem; letter-spacing: 0.01em; transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s; }
         .stButton > button:hover { border-color: var(--antihub-pink); box-shadow: 0 2px 8px rgba(226, 90, 138, 0.14); color: var(--antihub-ink); transform: translateY(-1px); }
